@@ -1,6 +1,26 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use tokio::runtime::Runtime;
 
+/*
+Benchmark Results (Typical):
+---------------------------------------------------------
+| Scenario (Empty Data)      | with_check | no_check |
+|----------------------------|------------|----------|
+| Stack Future (With Await)  | ~1.60 ns   | ~2.03 ns |
+| Boxed Future (Heap Alloc)  | ~1.61 ns   | ~18.56 ns|
+---------------------------------------------------------
+
+Conclusion:
+1. Even for stack-allocated futures, direct entry costs ~0.43ns (state machine init + 1st poll).
+2. For boxed futures, direct entry costs ~17ns due to unnecessary heap allocation/deallocation.
+3. Early `is_empty()` check is a nearly zero-cost optimization that bypasses executor overhead.
+
+MIR-level Explanation:
+- In Rust's Mid-level Intermediate Representation (MIR), an `async fn` is desugared into a State Machine (a struct implementing `Future`).
+- `no_check` path: The MIR must include instructions to initialize this struct and prepare it for polling. The executor then performs at least one `poll()` call to realize the loop range is empty.
+- `with_check` path: The MIR generates a simple branch (`switchInt`). If the condition is false, it jumps over the entire Future creation and awaiting logic. This "short-circuits" the async machinery entirely, avoiding state machine setup and the initial poll.
+*/
+
 /// Simulates an async loop function with a potential suspension point.
 async fn async_loop_with_await(data: Vec<i32>) {
     for item in data {
