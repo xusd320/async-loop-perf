@@ -15,10 +15,63 @@ Conclusion:
 2. For boxed futures, direct entry costs ~17ns due to unnecessary heap allocation/deallocation.
 3. Early `is_empty()` check is a nearly zero-cost optimization that bypasses executor overhead.
 
-MIR-level Explanation:
-- In Rust's Mid-level Intermediate Representation (MIR), an `async fn` is desugared into a State Machine (a struct implementing `Future`).
-- `no_check` path: The MIR must include instructions to initialize this struct and prepare it for polling. The executor then performs at least one `poll()` call to realize the loop range is empty.
-- `with_check` path: The MIR generates a simple branch (`switchInt`). If the condition is false, it jumps over the entire Future creation and awaiting logic. This "short-circuits" the async machinery entirely, avoiding state machine setup and the initial poll.
+MIR-level Explanation (see src/mir_demo.rs for full MIR output):
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ with_check::{closure#0} (Poll function for "with_check" Future)             │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ bb0: switchInt(discriminant) -> [0: bb1, ...]   // Check current state      │
+│                                                                              │
+│ bb1: _4 = Vec::is_empty(data)                   // Call is_empty()          │
+│      goto -> bb2                                                             │
+│                                                                              │
+│ bb2: switchInt(_4) -> [0: bb4, otherwise: bb3]  // Branch on result         │
+│      ┌─────────────┴─────────────┐                                          │
+│      ▼                           ▼                                          │
+│ bb3: (empty=true)           bb4: (empty=false)                              │
+│      _14 = const ()              _6 = async_work() // Create inner Future   │
+│      goto -> bb14                goto -> bb5...bb8  // Setup & poll         │
+│      ▼                                                                       │
+│ bb14: return Poll::Ready    // FAST PATH: Skip all async machinery!         │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ no_check::{closure#0} (Poll function for "no_check" Future)                 │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ bb0: switchInt(discriminant) -> [0: bb1, ...]   // Check current state      │
+│                                                                              │
+│ bb1: _4 = IntoIterator::into_iter(data)         // ALWAYS create iterator   │
+│      goto -> bb2                                                             │
+│                                                                              │
+│ bb2: store iterator in state machine            // ALWAYS store state       │
+│      goto -> bb3                                                             │
+│                                                                              │
+│ bb3: _5 = Iterator::next(&mut iter)             // ALWAYS call next()       │
+│      goto -> bb4                                                             │
+│                                                                              │
+│ bb4: switchInt(discriminant(_5)) -> [0: bb7, 1: bb6]                        │
+│      ┌─────────────┴─────────────┐                                          │
+│      ▼                           ▼                                          │
+│ bb7: (None - empty)         bb6: (Some - has items)                         │
+│      return Poll::Ready          _9 = async_work()                          │
+│      ▲                           ... more work ...                          │
+│      │                                                                       │
+│      └── Even for empty vec, we've already done:                            │
+│          1. IntoIterator::into_iter() call                                  │
+│          2. Iterator state stored in Future struct                          │
+│          3. Iterator::next() call                                           │
+│          4. Option discriminant check                                       │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+Key Insight:
+- with_check: On empty data, executes bb0 -> bb1 -> bb2 -> bb3 -> bb14 (5 blocks)
+  Only operations: is_empty() check + return Ready
+  
+- no_check: On empty data, executes bb0 -> bb1 -> bb2 -> bb3 -> bb4 -> bb7 (6 blocks)
+  Operations: into_iter() + store state + next() + discriminant check + return Ready
+  
+The ~0.43ns difference comes from the iterator creation and next() call overhead,
+even when no actual iteration occurs.
 */
 
 /// Simulates an async loop function with a potential suspension point.
