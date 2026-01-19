@@ -2,7 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use tokio::runtime::Runtime;
 
 /*
-Benchmark Results (Updated with realistic scenarios):
+Benchmark Results:
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ Scenario 1: CPU-bound (yield_now) - Pure async machinery overhead          │
@@ -13,15 +13,7 @@ Benchmark Results (Updated with realistic scenarios):
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ Scenario 2: Boxed Future - Heap allocation overhead                        │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ with_check (empty):  ~1.59 ns                                               │
-│ no_check (empty):    ~20.0 ns                                               │
-│ Difference:          ~18.4 ns (12x slower without check!)                   │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ Scenario 3: Simulated I/O (1µs sleep) - Real-world perspective             │
+│ Scenario 2: Simulated I/O (1µs sleep) - Real-world perspective             │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ with_check (1 item): ~1.15 ms  ← Dominated by sleep, not async overhead    │
 │ no_check (1 item):   ~1.15 ms  ← Same! I/O latency >> async overhead       │
@@ -38,18 +30,15 @@ Benchmark Results (Updated with realistic scenarios):
    - ~0.5ns difference exists but is NEGLIGIBLE in most applications
    - Only matters if you're processing BILLIONS of empty checks per second
 
-2. For Boxed/Spawned futures:
-   - ~18ns difference is SIGNIFICANT (heap alloc/dealloc)
-   - Worth optimizing in hot paths with frequent empty collections
-
-3. For I/O-bound workloads (the common case):
+2. For I/O-bound workloads (the common case):
    - Async overhead is COMPLETELY IRRELEVANT
    - 1µs I/O latency = 1000ns >> 0.5ns async overhead
    - Real network latency (1-100ms) makes this even more irrelevant
 
-4. PRACTICAL ADVICE:
-   ✅ Add empty check if: using Box::pin, tokio::spawn, or processing millions/sec
-   ❌ Don't bother if: I/O-bound, occasional calls, or code clarity matters more
+3. PRACTICAL ADVICE:
+   - The early empty check saves ~0.5ns per call
+   - This is rarely worth optimizing unless in extreme hot paths
+   - Code clarity usually matters more than this micro-optimization
 
 MIR-level Explanation (see src/mir_demo.rs for full MIR output):
 
@@ -160,42 +149,10 @@ fn bench_empty_check(c: &mut Criterion) {
     group.finish();
 
     // ============================================================
-    // Scenario 2: Boxed Future - Shows heap allocation overhead
-    // ============================================================
-    let mut group_boxed = c.benchmark_group("2. Boxed Future (heap alloc)");
-
-    async fn async_loop_boxed(data: Vec<i32>) {
-        if data.is_empty() { return; }
-        tokio::task::yield_now().await;
-    }
-
-    // Case A: Early check with Boxed Future
-    // Avoids heap allocation when data is empty.
-    group_boxed.bench_function("with_check", |b| {
-        b.to_async(&rt).iter(|| async {
-            let data = black_box(&empty_data);
-            if !data.is_empty() {
-                Box::pin(async_loop_boxed(data.clone())).await;
-            }
-        })
-    });
-
-    // Case B: Direct entry with Boxed Future
-    // Forces a heap allocation even if no work is performed.
-    group_boxed.bench_function("no_check", |b| {
-        b.to_async(&rt).iter(|| async {
-            let data = black_box(&empty_data);
-            Box::pin(async_loop_boxed(data.clone())).await;
-        })
-    });
-
-    group_boxed.finish();
-
-    // ============================================================
-    // Scenario 3: Simulated I/O (1µs sleep) - Real-world perspective
+    // Scenario 2: Simulated I/O (1µs sleep) - Real-world perspective
     // This shows that async overhead is negligible vs actual I/O latency
     // ============================================================
-    let mut group_io = c.benchmark_group("3. Simulated IO (1µs sleep)");
+    let mut group_io = c.benchmark_group("2. Simulated IO (1µs sleep)");
     group_io.sample_size(10); // Reduce samples due to sleep
 
     let one_item: Vec<i32> = vec![1]; // Single item to trigger actual work
