@@ -2,104 +2,86 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use tokio::runtime::Runtime;
 
 /*
-Benchmark Results:
+================================================================================
+Benchmark: Does an early `is_empty()` check improve async loop performance?
+================================================================================
+
+QUESTION:
+  When iterating over a potentially empty collection in async Rust, should you
+  add an early `if !data.is_empty()` check before entering the async loop?
+
+TESTED SCENARIOS:
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ Scenario 1: CPU-bound (yield_now) - Pure async machinery overhead          │
+│ Scenario 1: CPU-bound (yield_now) - Measures pure async machinery overhead │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ with_check (empty):  ~1.59 ns                                               │
+│ with_check (empty):  ~1.62 ns                                               │
 │ no_check (empty):    ~2.07 ns                                               │
-│ Difference:          ~0.48 ns (30% slower without check)                    │
+│ Difference:          ~0.45 ns (28% relative improvement)                    │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ Scenario 2: Simulated I/O (1µs sleep) - Real-world perspective             │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ with_check (1 item): ~1.15 ms  ← Dominated by sleep, not async overhead    │
-│ no_check (1 item):   ~1.15 ms  ← Same! I/O latency >> async overhead       │
-│ Difference:          ~0 (negligible)                                        │
+│ with_check (1 item): ~1.15 ms                                               │
+│ no_check (1 item):   ~1.15 ms                                               │
+│ Difference:          ~0 (I/O latency dominates, async overhead irrelevant) │
 │                                                                             │
-│ with_check (empty):  ~1.60 ns  ← Fast path                                  │
-│ no_check (empty):    ~2.10 ns  ← Still has iterator overhead               │
-│ Difference:          ~0.5 ns (but who cares when I/O is 1ms?)              │
+│ with_check (empty):  ~1.61 ns                                               │
+│ no_check (empty):    ~2.09 ns                                               │
+│ Difference:          ~0.48 ns (but meaningless when I/O takes 1ms+)        │
 └─────────────────────────────────────────────────────────────────────────────┘
 
-⚠️ KEY TAKEAWAYS:
+================================================================================
+CONCLUSION
+================================================================================
 
-1. For CPU-bound micro-loops:
-   - ~0.5ns difference exists but is NEGLIGIBLE in most applications
-   - Only matters if you're processing BILLIONS of empty checks per second
+The ~0.5ns overhead of NOT checking `is_empty()` comes from:
+  1. Creating an iterator via `IntoIterator::into_iter()`
+  2. Calling `Iterator::next()` which returns `None` for empty collections
+  3. Matching on the `Option` discriminant
 
-2. For I/O-bound workloads (the common case):
-   - Async overhead is COMPLETELY IRRELEVANT
-   - 1µs I/O latency = 1000ns >> 0.5ns async overhead
-   - Real network latency (1-100ms) makes this even more irrelevant
+With an early `is_empty()` check, we skip all of the above and return immediately.
 
-3. PRACTICAL ADVICE:
-   - The early empty check saves ~0.5ns per call
-   - This is rarely worth optimizing unless in extreme hot paths
-   - Code clarity usually matters more than this micro-optimization
+HOWEVER, this optimization is RARELY meaningful because:
 
-MIR-level Explanation (see src/mir_demo.rs for full MIR output):
+  • 0.5ns = 0.0000005ms
+  • Typical network RTT: 1-100ms
+  • Typical disk I/O: 0.1-10ms
+  • Ratio: 1 : 2,000,000 to 1 : 200,000,000
 
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ with_check::{closure#0} (Poll function for "with_check" Future)             │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ bb0: switchInt(discriminant) -> [0: bb1, ...]   // Check current state      │
-│                                                                              │
-│ bb1: _4 = Vec::is_empty(data)                   // Call is_empty()          │
-│      goto -> bb2                                                             │
-│                                                                              │
-│ bb2: switchInt(_4) -> [0: bb4, otherwise: bb3]  // Branch on result         │
-│      ┌─────────────┴─────────────┐                                          │
-│      ▼                           ▼                                          │
-│ bb3: (empty=true)           bb4: (empty=false)                              │
-│      _14 = const ()              _6 = async_work() // Create inner Future   │
-│      goto -> bb14                goto -> bb5...bb8  // Setup & poll         │
-│      ▼                                                                       │
-│ bb14: return Poll::Ready    // FAST PATH: Skip all async machinery!         │
-└──────────────────────────────────────────────────────────────────────────────┘
+PRACTICAL ADVICE:
 
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ no_check::{closure#0} (Poll function for "no_check" Future)                 │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ bb0: switchInt(discriminant) -> [0: bb1, ...]   // Check current state      │
-│                                                                              │
-│ bb1: _4 = IntoIterator::into_iter(data)         // ALWAYS create iterator   │
-│      goto -> bb2                                                             │
-│                                                                              │
-│ bb2: store iterator in state machine            // ALWAYS store state       │
-│      goto -> bb3                                                             │
-│                                                                              │
-│ bb3: _5 = Iterator::next(&mut iter)             // ALWAYS call next()       │
-│      goto -> bb4                                                             │
-│                                                                              │
-│ bb4: switchInt(discriminant(_5)) -> [0: bb7, 1: bb6]                        │
-│      ┌─────────────┴─────────────┐                                          │
-│      ▼                           ▼                                          │
-│ bb7: (None - empty)         bb6: (Some - has items)                         │
-│      return Poll::Ready          _9 = async_work()                          │
-│      ▲                           ... more work ...                          │
-│      │                                                                       │
-│      └── Even for empty vec, we've already done:                            │
-│          1. IntoIterator::into_iter() call                                  │
-│          2. Iterator state stored in Future struct                          │
-│          3. Iterator::next() call                                           │
-│          4. Option discriminant check                                       │
-└──────────────────────────────────────────────────────────────────────────────┘
+  ❌ DON'T add early empty checks for:
+     - I/O-bound async code (network, disk, database)
+     - Code where readability matters more than nanoseconds
+     - Anything called less than millions of times per second
 
-Key Insight:
-- with_check: On empty data, executes bb0 -> bb1 -> bb2 -> bb3 -> bb14 (5 blocks)
-  Only operations: is_empty() check + return Ready
-  
-- no_check: On empty data, executes bb0 -> bb1 -> bb2 -> bb3 -> bb4 -> bb7 (6 blocks)
-  Operations: into_iter() + store state + next() + discriminant check + return Ready
-  
-The ~0.43ns difference comes from the iterator creation and next() call overhead,
-even when no actual iteration occurs.
+  ✅ CONSIDER adding early empty checks for:
+     - Extremely hot CPU-bound loops (billions of calls/sec)
+     - When profiling shows this specific code path as a bottleneck
+
+BOTTOM LINE:
+  The performance gain exists but is negligible in real-world applications.
+  Prioritize code clarity over this micro-optimization.
+
+================================================================================
+MIR-level Explanation (run: rustup run nightly rustc -Z unpretty=mir src/mir_demo.rs)
+================================================================================
+
+with_check path (empty data):
+  bb0 -> bb1 (is_empty) -> bb2 (branch) -> bb3 (return Ready)
+  Operations: len check + branch + return
+
+no_check path (empty data):
+  bb0 -> bb1 (into_iter) -> bb2 (store) -> bb3 (next) -> bb4 (match) -> bb7 (return)
+  Operations: iterator creation + state storage + next() + Option match + return
+
+The extra ~0.45ns comes from iterator setup and the next() call, even when
+the loop body never executes.
 */
 
-/// Simulates an async loop function with a potential suspension point.
+/// Simulates an async loop function with a potential suspension point./// Simulates an async loop function with a potential suspension point.
 async fn async_loop_with_await(data: Vec<i32>) {
     for item in data {
         // Key point: even with 0 iterations, the generated Future state machine 
